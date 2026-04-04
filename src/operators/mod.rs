@@ -5,6 +5,7 @@
 //! detection and scene chunking.
 
 pub mod hallucination;
+pub mod scene;
 pub mod scene_chunker;
 
 use crate::error::{PipelineError, Result};
