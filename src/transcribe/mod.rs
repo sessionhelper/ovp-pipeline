@@ -31,6 +31,8 @@ pub async fn transcribe(
     let mut all_segments = Vec::new();
     let mut segment_index = 0u32;
     let mut total_audio_secs = 0.0f32;
+    let mut min_request_ms = u128::MAX;
+    let mut max_request_ms = 0u128;
 
     for (i, chunk) in chunks.iter().enumerate() {
         let chunk_duration = chunk.samples.len() as f32 / chunk.sample_rate as f32;
@@ -39,6 +41,9 @@ pub async fn transcribe(
         let start = std::time::Instant::now();
         let segments = transcribe_chunk(config, chunk, session_id, &mut segment_index).await?;
         let request_ms = start.elapsed().as_millis();
+
+        min_request_ms = min_request_ms.min(request_ms);
+        max_request_ms = max_request_ms.max(request_ms);
 
         tracing::debug!(
             stage = "whisper",
@@ -54,10 +59,14 @@ pub async fn transcribe(
         all_segments.extend(segments);
     }
 
+    if min_request_ms == u128::MAX { min_request_ms = 0; }
+
     tracing::info!(
         total_segments = all_segments.len(),
         chunks = chunks.len(),
         total_audio_secs = format_args!("{:.1}", total_audio_secs),
+        min_request_ms = min_request_ms,
+        max_request_ms = max_request_ms,
         "transcription complete"
     );
 
@@ -72,7 +81,9 @@ async fn transcribe_chunk(
     session_id: Uuid,
     segment_index: &mut u32,
 ) -> Result<Vec<TranscriptSegment>> {
+    let encode_start = std::time::Instant::now();
     let wav_bytes = encode_wav(chunk)?;
+    let encode_ms = encode_start.elapsed().as_millis();
 
     let client = reqwest::Client::new();
 
@@ -81,7 +92,7 @@ async fn transcribe_chunk(
         .text("response_format", "verbose_json")
         .part(
             "file",
-            reqwest::multipart::Part::bytes(wav_bytes)
+            reqwest::multipart::Part::bytes(wav_bytes.clone())
                 .file_name("audio.wav")
                 .mime_str("audio/wav")
                 .map_err(|e| PipelineError::Transcribe(e.to_string()))?,
@@ -91,12 +102,14 @@ async fn transcribe_chunk(
         form = form.text("language", lang.clone());
     }
 
+    let send_start = std::time::Instant::now();
     let response = client
         .post(&config.endpoint)
         .multipart(form)
         .send()
         .await
         .map_err(|e| PipelineError::Transcribe(format!("HTTP request failed: {}", e)))?;
+    let ttfb_ms = send_start.elapsed().as_millis(); // time to first byte — includes inference
 
     if !response.status().is_success() {
         let status = response.status();
@@ -110,10 +123,12 @@ async fn transcribe_chunk(
         )));
     }
 
+    let parse_start = std::time::Instant::now();
     let body: serde_json::Value = response
         .json()
         .await
         .map_err(|e| PipelineError::Transcribe(format!("failed to parse response: {}", e)))?;
+    let parse_ms = parse_start.elapsed().as_millis();
 
     // Parse OpenAI-compatible verbose_json response
     let whisper_segments = body["segments"]
@@ -150,6 +165,17 @@ async fn transcribe_chunk(
             })
         })
         .collect();
+
+    tracing::trace!(
+        stage = "whisper",
+        speaker = %chunk.speaker,
+        encode_ms = encode_ms,
+        ttfb_ms = ttfb_ms,
+        parse_ms = parse_ms,
+        payload_bytes = wav_bytes.len(),
+        segments = segments.len(),
+        "chunk request breakdown"
+    );
 
     Ok(segments)
 }
