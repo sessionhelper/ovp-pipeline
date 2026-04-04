@@ -8,6 +8,7 @@
 //! **No I/O except HTTP to Whisper.** No S3, no Postgres, no file system.
 //! Caller provides audio bytes, crate returns objects.
 
+pub mod ad;
 pub mod audio;
 pub mod error;
 pub mod filters;
