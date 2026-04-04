@@ -2,330 +2,322 @@
 
 ## Purpose
 
-A Rust library crate for audio transcription of TTRPG voice sessions. Ingests per-speaker PCM audio chunks from S3 (uploaded by the bot during recording), runs voice activity detection, transcribes via whisper.cpp, filters hallucinations, chunks into scenes, and writes transcript segments to Postgres.
+A Rust library crate that processes multi-speaker voice audio into enriched, structured transcripts. Takes per-speaker mono f32 PCM sample streams, runs audio/speech detection, transcribes, corrects, and enriches via a chain of stateful processing stages.
 
-Designed for reuse across the Session Helper ecosystem:
-- **ttrpg-collector bot** — triggers transcription after `/stop`, or incrementally as chunks arrive (future)
-- **Rust API (Axum)** — kick off transcription on demand, re-process sessions
-- **Session Helper** — potential replacement for the Python streaming pipeline (future)
+**Pure processing library — no storage.** No S3, no Postgres, no filesystem. Stages make HTTP calls to external inference services (Whisper, LLM APIs, lore APIs) as part of processing. Each stage manages its own endpoints via its own config. Caller provides mono f32 samples per speaker, crate returns enriched transcript segments. Byte decoding, stereo downmix, storage, and session management are the caller's responsibility.
 
-## Bot Audio Upload Model
+## What's In the Crate
 
-The bot uploads audio to S3 **during recording**, not at `/stop`:
+The full processing pipeline from "I have mono f32 samples for each speaker" to "here are your enriched transcript segments":
 
-1. **On recording start:** bot writes `meta.json` (partial) and `consent.json` to S3 immediately
-2. **During recording:** bot buffers raw PCM per speaker, uploads **50MB chunks** to S3 as they fill
-3. **On `/stop`:** bot flushes final partial buffers, overwrites `meta.json` with final version (adds `ended_at`, `duration_seconds`)
+- Resample to 16kHz (if input is at a different rate)
+- RMS audio detection (silence gate)
+- Silero VAD (speech vs non-speech)
+- Whisper transcription (via external HTTP endpoint)
+- Hallucination filtering
+- Scene chunking
+- *(Planned)* Lore reconciliation (name correction + entity linking via lore API)
+- *(Planned)* Context-aware scene segmentation (LLM)
 
-### S3 Layout
+Each stage is self-contained: it has its own config with whatever HTTP endpoints it needs, manages its own calls, and transforms its input stream into its output stream. No shared HTTP client or central services config.
+
+## What's NOT in the Crate
+
+Everything about where audio comes from and where results go:
+
+- Byte decoding (s16le → f32), stereo downmix, format conversion
+- S3 fetching / uploading
+- Database reads / writes
+- Discord integration
+- The lore database itself (stages query it via HTTP API)
+- Craig FLAC ingestion (this is in the CLI test scaffold, not the library)
+- Pseudonymization / consent logic
+- Session management
+- Transcript rendering (screenplay format, lane view, etc.)
+
+The CLI binary (`ovp-cli`, behind the `cli` feature) is a **test scaffold**, not part of the library API. It handles Craig FLAC conversion and file I/O for development purposes only.
+
+## Stage Graph
+
+The crate receives per-speaker mono f32 sample streams. How those samples were produced is the caller's concern.
+
+```mermaid
+graph TD
+    subgraph input ["Caller provides"]
+        SA["Speaker A — mono f32"]
+        SB["Speaker B — mono f32"]
+        SC["Speaker C — mono f32"]
+    end
+
+    subgraph audio ["Audio Detection"]
+        RS["Resample → 16kHz"]
+        RMS["RMS Energy Gate"]
+        VAD["Silero VAD"]
+    end
+
+    subgraph transcription ["Transcription"]
+        W["Whisper"]
+        HF["Hallucination Filter"]
+    end
+
+    subgraph enrichment ["Enrichment ― planned"]
+        CT["Crosstalk Detector"]
+        LR["Lore Reconciliation<br><i>name correction + entity linking</i>"]
+        SS["Scene Segmentation"]
+    end
+
+    subgraph ext ["External Services ― HTTP"]
+        WE(["Whisper Endpoint"])
+        LORE(["Lore API"])
+        LLM(["LLM API"])
+    end
+
+    SA & SB & SC --> RS
+    RS -- SampleEvents --> RMS
+    RMS -- AudioSegments --> VAD
+    VAD -- SpeechEvents --> W
+    VAD -- SpeechEvents --> CT
+    W <--> WE
+    W -- SegmentEvents --> HF
+    CT -- CrosstalkEvents -..-> HF
+    HF -- FilteredSegments --> LR
+    LR <--> LORE
+    LR -- ReconciledSegments --> SS
+    SS <--> LLM
+    SS -- EnrichedSegments --> OUT
+
+    OUT["Enriched TranscriptSegments — returned to caller"]
+```
+
+Each stage is a stateful transformer that consumes events from its input stream, maintains internal state, and emits enriched events on its output stream.
+
+### Forward Enrichment
+
+Events accumulate context as they flow through the pipeline. Each stage attaches its findings to the event before passing it forward. By the time an event reaches a higher stage, it carries everything the earlier stages learned:
 
 ```
-sessions/{guild_id}/{session_id}/
-  meta.json                              # Written at start, overwritten at stop
-  consent.json                           # Written at start, overwritten at stop
-  audio/
-    {pseudo_id_a}/
-      chunk_0000.pcm                     # 50MB raw PCM (s16le, 48kHz, stereo)
-      chunk_0001.pcm                     # ~4.4 minutes per chunk
-      chunk_0002.pcm
-      chunk_0003.pcm                     # Final chunk may be smaller
-    {pseudo_id_b}/
-      chunk_0000.pcm
-      chunk_0001.pcm
-      ...
+A SegmentEvent carries:
+  speaker_pseudo_id    (from decode — who said it)
+  speech_timing        (from VAD — when exactly)
+  text + confidence    (from Whisper — what they said)
+  filter flags         (from hallucination filter)
+  entity_links         (from lore reconciliation)
+  scene_id             (from scene segmentation)
 ```
 
-### Chunk Format
+**Higher stages read context off the event, not by subscribing to lower streams.** Lore reconciliation uses `speaker_pseudo_id` (already on the event) to disambiguate entities — it doesn't subscribe to SpeechEvents. Scene segmentation uses entity links (already on the event) for context — it doesn't subscribe to the lore API directly.
 
-Raw PCM: signed 16-bit little-endian, 48kHz, 2 channels (stereo). This is exactly what Discord/Songbird delivers — zero encoding overhead during recording.
+This keeps the graph sparse. Each stage subscribes to its direct input stream plus at most one or two cross-cutting streams (like CrosstalkEvents). Stages never fan-in to "all the streams just in case."
 
-50MB = ~4.4 minutes of audio per chunk. A 3-hour session with 4 speakers produces ~160 chunks.
+### Event Buffers
 
-### Benefits
+Every event stream maintains a sequential buffer. Stages don't just see the current event — they can query backward into any stream they subscribe to:
 
-- **Crash resilience** — metadata and most audio already in S3 if bot dies mid-session
-- **Pipeline can start early** — process chunks as they arrive, before session ends (future)
-- **Lower peak disk usage** — chunks can be cleaned from local disk after upload
-- **No ffmpeg in the bot** — no PCM→FLAC conversion step at `/stop`
+- **By time window:** "give me the last 30 seconds of events" — scene segmentation checks if a silence gap is a real break or a mid-scene pause
+- **By count:** "give me the last 10 segments" — lore reconciliation uses recent transcript context to disambiguate references ("he" → which character, given who was just mentioned?)
+- **By predicate:** "give me all CrosstalkEvents in the last 60 seconds" — scene segmentation looks for bursts of crosstalk as dramatic moment markers
 
-## Pipeline
+Buffer depth is configurable per stream per stage. Audio-level stages need shallow buffers (seconds). Text-level stages need deeper context (minutes of transcript history). The buffer is the stage's read-only view into the past of any stream it subscribes to.
+
+This is what makes context-aware stages possible. The hallucination filter already does this implicitly (frequency counters are a form of buffer over the full segment history). The event buffer formalizes the pattern and makes it available to all stages.
+
+```rust
+// A stage receives the current event plus a queryable view of stream history
+trait Stage {
+    type Output;
+
+    fn process(
+        &mut self,
+        event: TaggedEvent,
+        buffers: &StreamBuffers,    // read-only history for all subscribed streams
+    ) -> Vec<Self::Output>;
+
+    fn flush(&mut self) -> Vec<Self::Output>;
+}
+
+impl StreamBuffers {
+    fn query_time(&self, stream: StreamId, window_secs: f32) -> &[Event];
+    fn query_last(&self, stream: StreamId, count: usize) -> &[Event];
+}
+```
+
+### Correction History
+
+Every correctable event (segments, entity links, scene boundaries) retains its full correction history as append-only layers. The original value is always preserved — corrections never overwrite, they stack.
+
+```rust
+struct CorrectionLayer {
+    stage: StageId,          // which stage made this correction
+    pass: u32,               // which pass (0 = original, 1+ = corrections)
+    old_value: String,
+    new_value: String,
+    reason: String,          // why — "entity_link: 'the father' → Tullus Renis"
+    timestamp: f32,          // event time, not wall clock
+}
+```
+
+A segment's `text` is always the latest layer. `original_text` is always layer 0 (Whisper output). The full history is available for audit, undo, and training data generation (`original → corrected` pairs).
+
+### Back-Propagation
+
+When a later stage discovers something that affects earlier output, it emits a `CorrectionEvent` that flows backward through the pipeline. Stages that subscribe to correction events re-evaluate their earlier output against the event buffers.
+
+```mermaid
+graph LR
+    SS["Scene Segmentation"] -- "CorrectionEvent: merge scenes 3+4" --> HF["Hallucination Filter"]
+    SS -- "CorrectionEvent: reclassify segment as scene transition" --> LR["Lore Reconciliation"]
+```
+
+Examples:
+- **Scene segmentation** realizes a silence gap was just a dramatic pause → emits CorrectionEvent → hallucination filter's scene chunker merges the two scenes
+- **Scene segmentation** identifies a scene transition that changes entity context → emits CorrectionEvent → lore reconciliation re-evaluates buffered segments against the new scene context
+- **Lore reconciliation** gets a lore update mid-session (new character introduced) → re-evaluates its own buffered segments against the new entity list (self-correction, not cross-stage)
+
+**DAG constraint:** Correction events only flow from higher-abstraction stages to lower-abstraction stages, never the reverse:
 
 ```
-S3 chunks (per-speaker raw PCM, 50MB each)
-  │
-  ├─ Speaker A: chunk_0000..chunk_000N ──→ concatenate in order
-  ├─ Speaker B: chunk_0000..chunk_000N ──→ concatenate in order
-  ├─ Speaker C: chunk_0000..chunk_000N ──→ concatenate in order
-  │                          ↓ (parallel per speaker)
-  │              resample 48→16kHz (rubato)
-  │                          ↓
-  │                    VAD (silero via ort)
-  │                          ↓
-  │                    speech regions [(start, end), ...]
-  │                          ↓
-  └──────────────→ interleave by time across all speakers
-                          ↓
-                   chunk extraction (seek into PCM stream)
-                          ↓
-                   Whisper transcription (whisper-rs, in-process)
-                          ↓
-                   timestamp mapping: absolute = chunk.original_start + whisper.start
-                          ↓
-                   write segment to Postgres immediately
-                          ↓
-                   ┌─────────────────────────────┐
-                   │ Filter 1: Hallucination      │ per-segment inline + periodic sweep
-                   │ Filter 2: Scene Chunker      │ silence gaps + duration limits
-                   └─────────────────────────────┘
-                          ↓
-                      Postgres (transcript_segments table)
+Layer 0: Audio        (resample, RMS, VAD)
+Layer 1: Transcribe   (Whisper, hallucination filter)
+Layer 2: Reconcile    (lore reconciliation — name correction + entity linking)
+Layer 3: Structure    (scene segmentation)
+                ←── corrections flow downward only ──←
 ```
+
+Layer 3 can correct layers 2 and 1. Layer 2 can correct layer 1. No upward corrections. No same-layer corrections. This eliminates recursive loops by construction.
+
+**Self-correction** is allowed: a stage can re-evaluate its own buffer when it receives new information. Example: lore reconciliation processes "the merchant" with no match, then later processes "You meet a woman named Serena Voss" — it recognizes the introduction, creates a provisional entity, and re-scans its own buffer to link earlier "the merchant" references. This is internal re-evaluation, not a cross-layer correction, so no DAG violation.
+
+### Deferred Corrections
+
+Back-propagation is bounded by buffer depth. Corrections that target segments outside the buffer (e.g., a scene 8 reference to a character from scene 2) can't be applied immediately.
+
+These corrections are captured in a **deferred correction log** — a stream of `DeferredCorrection` events that record the intent without applying it:
+
+```rust
+struct DeferredCorrection {
+    target_segment_id: Uuid,
+    stage: StageId,
+    correction: CorrectionLayer,
+}
+```
+
+After the session ends, a **finalization pass** replays the deferred correction log against the full segment set (no buffer limits — everything is in the database). This catches long-range references that the streaming pass couldn't reach.
+
+The finalization pass is idempotent: corrections append layers, so running it multiple times produces the same result. It only runs on completed sessions, not during live streaming.
+
+Back-propagation is also bounded by buffer depth: a stage only re-evaluates events still in its buffer. Events that have aged out are final.
+
+Corrections always append a new layer — they never mutate the original. A segment corrected by back-propagation has its full history: Whisper output → first correction → back-propagated correction.
+
+### Batch vs Live
+
+In batch mode, all samples are pumped through immediately. In live mode (future), samples arrive at real-time rate. Stages don't care — they process what arrives. Event buffers and back-propagation work identically in both modes since they're indexed by event time, not wall clock time.
 
 ## Stages
 
-### 1. Audio Ingestion
+### 1. Resample
 
-Accepts per-speaker audio as ordered S3 chunk lists, local files, or raw bytes. No intermediate files — audio stays as sample slices in memory.
+**Input:** `SpeakerTrack` — per-speaker mono f32 samples at any sample rate
+**Output:** `SpeakerTrack` at 16kHz (no-op if already 16kHz)
 
 ```rust
 pub struct SpeakerTrack {
     pub pseudo_id: String,
-    pub audio: AudioSource,
-    pub sample_rate: u32,       // 48kHz from Discord
-    pub channels: u16,          // 2 (stereo) from Discord
-    pub bit_depth: u16,         // 16
-}
-
-pub enum AudioSource {
-    /// Single file (FLAC or raw PCM)
-    File(PathBuf),
-    /// Single S3 object
-    S3Object { bucket: String, key: String },
-    /// Ordered sequence of S3 chunks — the primary ingestion path
-    S3Chunked {
-        bucket: String,
-        prefix: String,         // "sessions/{guild}/{session}/audio/{pseudo_id}/"
-    },
-    /// Raw bytes in memory
-    Bytes(Vec<u8>),
+    pub samples: Vec<f32>,       // Mono f32 in [-1.0, 1.0]
+    pub sample_rate: u32,        // e.g. 48000 from Discord
 }
 ```
 
-For `S3Chunked`, the pipeline:
-1. Lists objects under the prefix
-2. Sorts by chunk sequence number (lexicographic on `chunk_NNNN.pcm`)
-3. Streams chunks in order, reinterpreting raw bytes as i16 samples
-4. Downmixes stereo → mono (average L+R channels)
+### 2. RMS Audio Detection (Tier 1)
 
-**Memory:** processes one S3 chunk at a time (~50MB = ~1.3M stereo samples). After VAD marks speech regions, only those regions are held for extraction. Peak memory is well under 100MB per speaker.
+**Input:** 16kHz mono f32 samples
+**Output:** `AudioSegment { speaker, samples, start_time, end_time }`
 
-### 2. Resample
+Cheap energy gate. Computes RMS over 30ms windows. When energy exceeds threshold, accumulates. When energy stays below threshold for a configurable gap, emits the segment. Silence never passes this stage.
 
-Discord audio is 48kHz. Whisper expects 16kHz. Rubato handles sample rate conversion (3:1 ratio).
+```rust
+pub struct RmsConfig {
+    pub threshold: f32,            // Default 0.01
+    pub frame_size: usize,         // Default 480 (30ms at 16kHz)
+    pub silence_gap: f32,          // Default 0.5s
+    pub min_segment_duration: f32, // Default 0.1s
+}
+```
 
-Resampling happens after downmix to mono — so we're resampling one channel, not two.
+### 3. Silero VAD (Tier 2)
 
-No WAV, no FLAC, no intermediate files. Audio is f32 slices throughout.
+**Input:** `AudioSegment` (from RMS gate)
+**Output:** `AudioChunk` (confirmed speech, ready for Whisper)
 
-### 3. Voice Activity Detection (Silero VAD)
+Silero VAD v6 (~1.2MB ONNX model) on each audio segment. Distinguishes speech from non-speech audio (keyboard, breathing, mic bumps). May split one segment into multiple speech chunks or drop it entirely.
 
-Silero VAD is a small neural network (~2MB ONNX model) purpose-built for speech detection. Runs via `ort` (ONNX Runtime for Rust). Processes 30ms frames, outputs speech probability 0.0–1.0.
+**Model interface (Silero VAD v6):**
+- Input: `[N, 576]` frames (36ms each at 16kHz) + LSTM state `h`/`c` at `[1, 1, 128]`
+- Output: `speech_probs[N]` + updated LSTM state
+- State carried between batches
 
 ```rust
 pub struct VadConfig {
-    pub threshold: f32,             // Speech probability cutoff (default 0.5)
-    pub min_speech_duration: f32,   // Minimum speech region seconds (default 0.25)
-    pub min_silence_duration: f32,  // Silence needed to split regions (default 0.8)
-    pub speech_pad: f32,            // Padding around speech (default 0.1)
+    pub model_path: PathBuf,
+    pub threshold: f32,              // Default 0.5
+    pub min_speech_duration: f32,    // Default 0.25s
+    pub min_silence_duration: f32,   // Default 0.8s
+    pub speech_pad: f32,             // Default 0.1s
 }
 ```
 
-**Per-speaker, parallel.** Each track runs VAD independently via `tokio::spawn`. Output is a flat `Vec<SpeechRegion>` sorted chronologically across all speakers.
+### 4. Whisper Transcription
 
-```rust
-pub struct SpeechRegion {
-    pub start: f32,
-    pub end: f32,
-    pub speaker: String,
-}
-```
+**Input:** `AudioChunk` (confirmed speech)
+**Output:** `TranscriptSegment` (text + absolute timestamps + speaker + confidence)
 
-Regions shorter than `min_chunk_duration` (default 0.8s) are dropped as noise/blips.
-
-### 4. Chunk Extraction
-
-Given speech regions, seek into the speaker's PCM stream and extract that segment. For S3 chunked input, we know the byte offset: `offset = (start_seconds * sample_rate * channels * bytes_per_sample)`, which maps to a specific S3 chunk + position within it.
-
-```rust
-pub struct AudioChunk {
-    pub speaker: String,
-    pub samples: Vec<f32>,          // 16kHz f32 mono (resampled)
-    pub sample_rate: u32,           // 16000
-    pub original_start: f32,        // Absolute timestamp in session
-    pub original_end: f32,
-}
-```
-
-Chunks are ordered chronologically across all speakers.
-
-### 5. Whisper Transcription
-
-In-process via `whisper-rs` (bindings to whisper.cpp). Model loaded once, reused for all chunks.
+Encodes chunks as WAV, sends to an external OpenAI-compatible HTTP endpoint. Maps Whisper's relative timestamps to absolute session time.
 
 ```rust
 pub struct TranscriberConfig {
-    pub model_path: PathBuf,        // Path to ggml model file
-    pub language: Option<String>,   // e.g. "en", None for auto-detect
-    pub n_threads: u32,             // CPU threads for whisper.cpp (default 4)
+    pub endpoint: String,
+    pub model: String,
+    pub language: Option<String>,
 }
 ```
 
-**Timestamp mapping:**
-```
-absolute_start = chunk.original_start + whisper_segment.start
-absolute_end   = chunk.original_start + whisper_segment.end
-```
+### 5. Filter Chain
 
-No concatenation, no drift — each chunk is independently timestamped.
+Pluggable via the `StreamFilter` trait. Crate ships two filters:
 
-**Model options:**
-- `ggml-large-v3-turbo` — best quality, ~3GB, slower
-- `ggml-distil-large-v3` — good balance
-- `ggml-base` — fast, good for testing
+**Hallucination Detection:** Frequency-based, no hardcoded phrase list. With RMS+VAD in place, this is a secondary defense. Also handles **cross-speaker deduplication** — when audio bleed causes the same text to appear on multiple speaker tracks at overlapping timestamps, the duplicate is excluded (uses CrosstalkEvents from the crosstalk detector to identify overlap windows).
 
-Segments are written to Postgres immediately as they're produced.
-
-### 6. Filter Chain
-
-Two filters:
-
-```rust
-pub trait StreamFilter: Send + Sync + 'static {
-    async fn on_segment(&mut self, segment: &mut TranscriptSegment) -> FilterResult;
-    async fn sweep(&mut self, db: &PgPool) -> Result<u32>;
-    async fn finalize(&mut self, db: &PgPool) -> Result<()>;
-}
-
-pub enum FilterResult {
-    Pass,
-    Exclude { reason: String },
-}
-```
-
-#### Filter 1: Hallucination Detection
-
-Frequency-based, no hardcoded phrase list.
-
-**State:**
-```rust
-pub struct HallucinationFilter {
-    global_counts: HashMap<String, u32>,
-    per_speaker_counts: HashMap<String, HashMap<String, u32>>,
-    noise_texts: HashSet<String>,
-    segment_count: u32,
-    pending: Vec<Uuid>,
-}
-```
-
-**Inline (per segment):** empty text, repeated phrases (5+), no letters, known noise → exclude.
-
-**Sweep (every 120s):** short text >3% frequency → noise; one speaker >80% same text → noise. Retroactively marks pending segments. Buffer drains each sweep.
-
-#### Filter 2: Scene Chunker
-
-```rust
-pub struct SceneChunkerConfig {
-    pub max_silence_gap: f32,       // Default 30.0s
-    pub max_chunk_duration: f32,    // Default 600.0s
-}
-```
-
-Assigns `chunk_group` to each segment for UI organization.
+**Scene Chunker:** Assigns `chunk_group` to segments based on silence gaps and duration limits.
 
 ## Public API
 
-### Batch Mode (process a completed session)
-
-The happy path reads top-to-bottom. Each step takes input and returns output via `?`. No nesting, no manual error matching. If any step fails, the error propagates to the caller.
-
 ```rust
-/// Process a completed recording session end-to-end.
-/// Each stage is a plain function chained with `?` — the compiler
-/// enforces that we don't skip steps or reorder them.
 pub async fn process_session(
     config: &PipelineConfig,
     input: SessionInput,
-) -> Result<PipelineResult> {
-    let samples = ingest(&config.s3, &input.tracks).await?;
-    let regions = detect_speech(&config.vad, &samples).await?;
-    let chunks = extract_chunks(&samples, &regions, config.min_chunk_duration)?;
-    let segments = transcribe(&config.whisper, &chunks).await?;
-    let filtered = apply_filters(segments, &mut config.filters).await?;
-    let result = commit(&config.db, input.session_id, &filtered).await?;
-
-    Ok(result)
-}
+    filters: &mut [Box<dyn StreamFilter>],
+) -> Result<PipelineResult>
 ```
-
-Each stage is a standalone async function. No wrapper types, no typestate — the function signature IS the contract. Stages are independently testable.
-
-### Incremental Mode (process as chunks arrive — future)
-
-```rust
-pub fn create_pipeline(
-    config: PipelineConfig,
-) -> (PipelineSender, PipelineHandle)
-
-impl PipelineSender {
-    /// Notify that a new S3 chunk is available for a speaker
-    pub async fn chunk_ready(&self, speaker: &str, chunk_key: &str) -> Result<()>;
-    /// Signal that the session has ended — flush and finalize
-    pub async fn finish(self) -> Result<PipelineResult>;
-}
-```
-
-### Configuration
 
 ```rust
 pub struct PipelineConfig {
-    pub db: PgPool,
-    pub s3: S3Client,
-    pub whisper: TranscriberConfig,
+    pub rms: RmsConfig,
     pub vad: VadConfig,
-    pub filters: Vec<Box<dyn StreamFilter>>,
-    pub min_chunk_duration: f32,    // Drop speech regions shorter than this (default 0.8s)
+    pub whisper: TranscriberConfig,
+    pub min_chunk_duration: f32,     // Drop speech < this (default 0.8s)
 }
 
 pub struct SessionInput {
     pub session_id: Uuid,
-    pub tracks: Vec<SpeakerTrack>,
+    pub tracks: Vec<SpeakerTrack>,   // Per-speaker PCM streams
 }
 
 pub struct PipelineResult {
+    pub segments: Vec<TranscriptSegment>,
     pub segments_produced: u32,
     pub segments_excluded: u32,
     pub scenes_detected: u32,
     pub duration_processed: f32,
-}
-```
-
-### Error Handling
-
-Single error enum for the whole crate. Each stage maps its internal errors into pipeline errors via `?`. The caller gets one type to match on.
-
-```rust
-#[derive(thiserror::Error, Debug)]
-pub enum PipelineError {
-    #[error("ingestion failed: {0}")]
-    Ingest(#[from] IngestError),
-    #[error("VAD failed: {0}")]
-    Vad(#[from] VadError),
-    #[error("transcription failed: {0}")]
-    Transcribe(#[from] TranscribeError),
-    #[error("database error: {0}")]
-    Db(#[from] sqlx::Error),
-    #[error("S3 error: {0}")]
-    S3(String),
 }
 ```
 
@@ -334,185 +326,65 @@ pub enum PipelineError {
 ```
 ovp-pipeline/
 ├── Cargo.toml
+├── models/
+│   └── silero_vad_v6.onnx         # ~1.2MB, gitignored
 ├── docs/
 │   └── architecture.md
 ├── src/
-│   ├── lib.rs                  # Public API surface
-│   ├── types.rs                # AudioChunk, SpeechRegion, TranscriptSegment, etc.
-│   ├── pipeline.rs             # Orchestration — batch + incremental modes
+│   ├── lib.rs                      # Public API + re-exports
+│   ├── types.rs                    # SpeakerTrack, AudioChunk, TranscriptSegment, etc.
+│   ├── error.rs                    # PipelineError enum
+│   ├── pipeline.rs                 # Orchestration: decode → resample → RMS → VAD → Whisper → filters
+│   ├── ad/
+│   │   └── mod.rs                  # RMS audio detection (tier 1)
 │   ├── audio/
-│   │   ├── mod.rs              # AudioSource, SpeakerTrack
-│   │   ├── decode.rs           # Raw PCM bytes → f32 samples, stereo→mono downmix
-│   │   ├── resample.rs         # 48kHz → 16kHz via rubato
-│   │   ├── encode.rs           # f32 → Opus/OGG (for serving to browsers)
-│   │   └── mix.rs              # Combine speaker tracks into single stream
-│   ├── ingest/
-│   │   ├── mod.rs              # Ingestion trait
-│   │   ├── s3_chunked.rs       # List + stream ordered S3 PCM chunks
-│   │   ├── file.rs             # Local file ingestion
-│   │   └── memory.rs           # In-memory bytes
+│   │   ├── mod.rs
+│   │   ├── resample.rs             # Any rate → 16kHz via rubato
+│   │   ├── encode.rs               # Stub: f32 → Opus/OGG (future)
+│   │   └── mix.rs                  # Stub: multi-track mixing (future)
 │   ├── vad/
-│   │   └── mod.rs              # Silero VAD via ort (ONNX runtime)
+│   │   └── mod.rs                  # Silero VAD v6 via ort (tier 2)
 │   ├── transcribe/
-│   │   └── mod.rs              # whisper-rs wrapper
+│   │   └── mod.rs                  # Whisper HTTP endpoint client
 │   └── filters/
-│       ├── mod.rs              # StreamFilter trait definition
-│       ├── hallucination.rs    # Frequency-based hallucination detection
-│       └── scene_chunker.rs    # Silence gap + duration-based scene boundaries
-└── tests/
-    ├── pipeline_test.rs
-    ├── vad_test.rs
-    ├── hallucination_test.rs
-    └── fixtures/
-        └── *.pcm              # Short test PCM clips
+│       ├── mod.rs                  # StreamFilter trait + apply_filters
+│       ├── hallucination.rs        # Frequency-based detection
+│       └── scene_chunker.rs        # Scene boundaries
+└── src/bin/
+    └── cli.rs                      # TEST SCAFFOLD (not library API)
 ```
 
 ## Dependencies
 
 | Crate | Purpose | Feature-gated |
 |-------|---------|---------------|
-| `rubato` | Sample rate conversion (48→16kHz) | no (core) |
-| `ort` | ONNX runtime for Silero VAD | `vad` feature |
-| `whisper-rs` | whisper.cpp bindings | `transcribe` feature |
-| `opus` | Opus encoding for browser playback | `opus` feature |
-| `ogg` | OGG container for Opus frames | `opus` feature |
-| `aws-sdk-s3` | Fetch audio chunks from S3 | no (core) |
-| `sqlx` | Postgres (write segments) | no (core) |
-| `tokio` | Async runtime, channels, tasks | no (core) |
-| `strsim` | Fuzzy string matching (future use) | no (core) |
+| `tokio` | Async runtime | no (core) |
+| `serde` / `serde_json` | Serialization | no (core) |
 | `uuid` | Segment/session IDs | no (core) |
-| `chrono` | Timestamps | no (core) |
 | `tracing` | Structured logging | no (core) |
+| `async-trait` | StreamFilter trait | no (core) |
+| `thiserror` | Error types | no (core) |
+| `ort` | ONNX Runtime for Silero VAD | `vad` feature |
+| `ndarray` | Tensor construction for ort | `vad` feature |
+| `reqwest` | HTTP client for Whisper | `transcribe` feature |
+| `rubato` | Sample rate conversion | `transcribe` feature |
 
-### Feature Flags
-
-```toml
-[features]
-default = ["vad", "transcribe"]
-vad = ["dep:ort"]
-transcribe = ["dep:whisper-rs", "dep:rubato"]
-opus = ["dep:opus", "dep:ogg"]
-full = ["vad", "transcribe", "opus"]
-```
+CLI-only deps (`cli` feature): `clap`, `symphonia-*`, `sha2`, `hex`, `chrono`, `tracing-subscriber`
 
 ## Design Principles
 
-1. **No ffmpeg.** All audio processing is native Rust. No subprocesses, no stderr parsing.
+1. **Pure processing library.** No storage, no database, no filesystem. Caller handles all I/O except Whisper HTTP.
 
-2. **No intermediate files.** Audio is f32 slices in memory. S3 chunks are streamed and processed — never written to local disk.
+2. **PCM in, transcript segments out.** The crate doesn't know or care where audio came from.
 
-3. **No WAV, no FLAC in the pipeline.** Input is raw PCM (from S3 chunks). Internal representation is f32 samples. Output encoding for browsers is Opus/OGG.
+3. **Two-tier audio detection.** RMS energy gate (cheap) → Silero VAD (ML). Silence never reaches Whisper.
 
-4. **Happy path reads top-to-bottom.** The main `process_session` function is a chain of `?` calls. Each stage is a plain function: input → output. No nesting, no manual error matching.
+4. **Transport boundaries are invisible.** After decode, audio is a continuous stream. How the caller chunked the input is irrelevant.
 
-5. **Stages are standalone functions.** Each stage takes typed input and returns typed output. Independently testable. No shared mutable state between stages.
+5. **Stages are standalone functions.** Typed input → typed output. Independently testable.
 
-6. **Filters are pluggable.** `StreamFilter` trait is the extension point. The crate ships with hallucination detection and scene chunking. Consumers add custom filters without modifying the crate.
+6. **Filters are pluggable.** `StreamFilter` trait. Consumers add custom filters without modifying the crate.
 
-7. **Errors propagate, don't panic.** `thiserror` enum with `#[from]` conversions. `?` everywhere. `.expect()` only in tests.
+7. **Errors propagate, don't panic.** `thiserror` + `?`.
 
-8. **Feature-gated dependencies.** Heavy deps (ONNX, whisper.cpp, libopus) behind feature flags. Default builds only pull what's needed.
-
-9. **Iterators over loops.** Use `.filter()`, `.map()`, `.for_each()` for data transformation. Especially in the filter chain where segments flow through multiple filters.
-
-## Bot Changes Required
-
-The bot currently writes continuous PCM files to local disk, converts to FLAC at `/stop`, then uploads everything. The new model:
-
-### During Recording
-
-Replace the single `{ssrc}.pcm` file writer with a chunked buffer:
-
-```rust
-struct ChunkedWriter {
-    speaker_pseudo_id: String,
-    buffer: Vec<u8>,
-    chunk_size: usize,          // 50MB (52_428_800 bytes)
-    chunk_seq: u32,
-    s3: S3Uploader,
-    session_prefix: String,     // "sessions/{guild}/{session}/audio/{pseudo_id}/"
-}
-
-impl ChunkedWriter {
-    fn write(&mut self, pcm_bytes: &[u8]) {
-        self.buffer.extend_from_slice(pcm_bytes);
-        if self.buffer.len() >= self.chunk_size {
-            self.flush();       // Upload to S3, increment seq, clear buffer
-        }
-    }
-    
-    async fn flush(&mut self) {
-        let key = format!("{}chunk_{:04}.pcm", self.session_prefix, self.chunk_seq);
-        self.s3.upload(&key, &self.buffer).await;
-        self.chunk_seq += 1;
-        self.buffer.clear();
-    }
-}
-```
-
-### On Recording Start (quorum met)
-
-Before any audio is captured:
-1. Write `meta.json` to S3 (partial — `ended_at` and `duration_seconds` are null)
-2. Write `consent.json` to S3
-3. Write session + participants to Postgres (already implemented in bot DB update)
-
-### On `/stop`
-
-1. Flush all ChunkedWriters (upload final partial buffers)
-2. Overwrite `meta.json` in S3 with final version (adds `ended_at`, `duration_seconds`, final counts)
-3. Overwrite `consent.json` if any consent changed mid-session
-4. Trigger pipeline: `ovp_pipeline::process_session(config, input).await`
-5. Update session status in Postgres
-6. Clean up local state
-
-### No More FLAC Conversion
-
-The bot no longer converts PCM→FLAC. Raw PCM chunks go straight to S3. The pipeline crate handles all audio processing. ffmpeg is no longer a runtime dependency of the bot.
-
-## Consumer Examples
-
-### ttrpg-collector bot (after /stop)
-
-```rust
-let result = ovp_pipeline::process_session(
-    PipelineConfig {
-        db: state.db.clone(),
-        s3: state.s3_client.clone(),
-        whisper: TranscriberConfig {
-            model_path: config.whisper_model.clone(),
-            language: Some("en".into()),
-            n_threads: 4,
-        },
-        vad: VadConfig::default(),
-        filters: ovp_pipeline::default_filters(),
-        min_chunk_duration: 0.8,
-    },
-    SessionInput {
-        session_id: bundle.session_id.parse()?,
-        tracks: participants.iter()
-            .filter(|p| p.consent_scope == "full")
-            .map(|p| SpeakerTrack {
-                pseudo_id: p.pseudo_id.clone(),
-                audio: AudioSource::S3Chunked {
-                    bucket: config.s3_bucket.clone(),
-                    prefix: format!(
-                        "sessions/{}/{}/audio/{}/",
-                        guild_id, bundle.session_id, p.pseudo_id
-                    ),
-                },
-                sample_rate: 48000,
-                channels: 2,
-                bit_depth: 16,
-            })
-            .collect(),
-    },
-).await?;
-```
-
-### Rust API (re-process endpoint)
-
-```rust
-// Same interface — reads chunks from S3, processes, writes segments to Postgres
-ovp_pipeline::process_session(config, input).await?;
-```
+8. **Feature-gated heavy deps.** ONNX runtime, reqwest, rubato behind feature flags.
