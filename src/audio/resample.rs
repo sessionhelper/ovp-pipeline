@@ -109,6 +109,68 @@ fn resample_speaker(
     })
 }
 
+#[cfg(all(test, feature = "transcribe"))]
+mod tests {
+    use super::*;
+
+    fn make_speaker(id: &str, samples: Vec<f32>, rate: u32) -> SpeakerSamples {
+        SpeakerSamples {
+            pseudo_id: id.into(),
+            samples,
+            sample_rate: rate,
+        }
+    }
+
+    #[test]
+    fn same_rate_is_noop() {
+        let speaker = make_speaker("a", vec![0.1, 0.2, 0.3], 16000);
+        let result = resample(&[speaker.clone()], 16000, 16000).unwrap();
+        assert_eq!(result[0].samples, speaker.samples);
+        assert_eq!(result[0].sample_rate, 16000);
+    }
+
+    #[test]
+    fn downsample_48_to_16_reduces_length() {
+        // 48000 samples at 48kHz = 1 second → should become ~16000 at 16kHz
+        let samples: Vec<f32> = (0..48000)
+            .map(|i| (i as f32 / 48000.0 * 440.0 * 2.0 * std::f32::consts::PI).sin() * 0.5)
+            .collect();
+        let speaker = make_speaker("a", samples, 48000);
+        let result = resample(&[speaker], 48000, 16000).unwrap();
+        assert_eq!(result[0].sample_rate, 16000);
+        // Should be approximately 16000 samples (1 second at 16kHz)
+        let len = result[0].samples.len();
+        assert!(len > 15000 && len < 17000,
+            "expected ~16000 samples, got {}", len);
+    }
+
+    #[test]
+    fn empty_input_returns_empty() {
+        let speaker = make_speaker("a", Vec::new(), 48000);
+        let result = resample(&[speaker], 48000, 16000).unwrap();
+        assert!(result[0].samples.is_empty());
+    }
+
+    #[test]
+    fn multiple_speakers_all_resampled() {
+        let a = make_speaker("a", vec![0.5; 48000], 48000);
+        let b = make_speaker("b", vec![0.5; 48000], 48000);
+        let result = resample(&[a, b], 48000, 16000).unwrap();
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0].pseudo_id, "a");
+        assert_eq!(result[1].pseudo_id, "b");
+        assert_eq!(result[0].sample_rate, 16000);
+        assert_eq!(result[1].sample_rate, 16000);
+    }
+
+    #[test]
+    fn preserves_speaker_id() {
+        let speaker = make_speaker("test_id_123", vec![0.5; 48000], 48000);
+        let result = resample(&[speaker], 48000, 16000).unwrap();
+        assert_eq!(result[0].pseudo_id, "test_id_123");
+    }
+}
+
 #[cfg(not(feature = "transcribe"))]
 fn resample_speaker(
     speaker: &SpeakerSamples,

@@ -303,6 +303,147 @@ fn filter_regions(
     filtered
 }
 
+#[cfg(all(test, feature = "vad"))]
+mod tests {
+    use super::*;
+
+    fn default_config() -> VadConfig {
+        VadConfig {
+            model_path: std::path::PathBuf::from("unused"),
+            threshold: 0.5,
+            min_speech_duration: 0.25,
+            min_silence_duration: 0.8,
+            speech_pad: 0.1,
+        }
+    }
+
+    #[test]
+    fn merge_all_speech() {
+        // All frames above threshold → one region
+        let probs = vec![0.9, 0.8, 0.7, 0.85, 0.9];
+        let regions = merge_speech_frames(&probs, 0.5, "spk");
+        assert_eq!(regions.len(), 1);
+        assert!(regions[0].start < 0.01);
+        assert!((regions[0].end - 5.0 * FRAME_DURATION).abs() < 0.01);
+    }
+
+    #[test]
+    fn merge_all_silence() {
+        let probs = vec![0.1, 0.2, 0.05, 0.3, 0.1];
+        let regions = merge_speech_frames(&probs, 0.5, "spk");
+        assert!(regions.is_empty());
+    }
+
+    #[test]
+    fn merge_two_speech_regions() {
+        // Speech, silence, speech
+        let probs = vec![0.9, 0.9, 0.1, 0.1, 0.1, 0.9, 0.9];
+        let regions = merge_speech_frames(&probs, 0.5, "spk");
+        assert_eq!(regions.len(), 2);
+        assert!(regions[1].start > regions[0].end);
+    }
+
+    #[test]
+    fn merge_single_frame_speech() {
+        let probs = vec![0.1, 0.9, 0.1];
+        let regions = merge_speech_frames(&probs, 0.5, "spk");
+        assert_eq!(regions.len(), 1);
+    }
+
+    #[test]
+    fn filter_drops_short_regions() {
+        let regions = vec![
+            SpeechRegion { speaker: "spk".into(), start: 0.0, end: 0.1 },  // 100ms — below 250ms min
+            SpeechRegion { speaker: "spk".into(), start: 1.0, end: 2.0 },  // 1s — above min
+        ];
+        let config = default_config();
+        let filtered = filter_regions(regions, &config, 5.0);
+        assert_eq!(filtered.len(), 1);
+        assert!(filtered[0].start < 1.0); // padded earlier
+        assert!(filtered[0].end > 2.0);   // padded later
+    }
+
+    #[test]
+    fn filter_merges_close_regions() {
+        // Two regions 0.5s apart — less than min_silence_duration (0.8s)
+        let regions = vec![
+            SpeechRegion { speaker: "spk".into(), start: 0.0, end: 1.0 },
+            SpeechRegion { speaker: "spk".into(), start: 1.5, end: 2.5 },
+        ];
+        let config = default_config();
+        let filtered = filter_regions(regions, &config, 5.0);
+        assert_eq!(filtered.len(), 1, "close regions should be merged");
+        assert!(filtered[0].end > 2.0);
+    }
+
+    #[test]
+    fn filter_keeps_distant_regions_separate() {
+        // Two regions 2s apart — more than min_silence_duration (0.8s)
+        let regions = vec![
+            SpeechRegion { speaker: "spk".into(), start: 0.0, end: 1.0 },
+            SpeechRegion { speaker: "spk".into(), start: 3.0, end: 4.0 },
+        ];
+        let config = default_config();
+        let filtered = filter_regions(regions, &config, 5.0);
+        assert_eq!(filtered.len(), 2);
+    }
+
+    #[test]
+    fn filter_padding_clamps_to_bounds() {
+        let regions = vec![
+            SpeechRegion { speaker: "spk".into(), start: 0.02, end: 0.5 },
+        ];
+        let config = VadConfig {
+            speech_pad: 0.1,
+            ..default_config()
+        };
+        let filtered = filter_regions(regions, &config, 1.0);
+        assert_eq!(filtered.len(), 1);
+        assert!(filtered[0].start >= 0.0, "padding should not go below 0");
+        assert!(filtered[0].end <= 1.0, "padding should not exceed total duration");
+    }
+
+    #[test]
+    fn filter_empty_input() {
+        let config = default_config();
+        let filtered = filter_regions(Vec::new(), &config, 5.0);
+        assert!(filtered.is_empty());
+    }
+
+    #[test]
+    fn extract_chunks_respects_min_duration() {
+        let samples = SpeakerSamples {
+            pseudo_id: "spk".into(),
+            samples: vec![0.0; 16000], // 1s at 16kHz
+            sample_rate: 16000,
+        };
+        let regions = vec![
+            SpeechRegion { speaker: "spk".into(), start: 0.0, end: 0.1 },  // 100ms — below 0.8s min
+            SpeechRegion { speaker: "spk".into(), start: 0.2, end: 0.95 }, // 750ms — below 0.8s min
+            SpeechRegion { speaker: "spk".into(), start: 0.0, end: 0.85 }, // 850ms — above 0.8s min
+        ];
+        let chunks = extract_chunks(&[samples], &regions, 0.8).unwrap();
+        assert_eq!(chunks.len(), 1, "only regions >= 0.8s should produce chunks");
+    }
+
+    #[test]
+    fn extract_chunks_correct_timestamps() {
+        let samples = SpeakerSamples {
+            pseudo_id: "spk".into(),
+            samples: vec![0.5; 32000], // 2s at 16kHz
+            sample_rate: 16000,
+        };
+        let regions = vec![
+            SpeechRegion { speaker: "spk".into(), start: 0.5, end: 1.5 },
+        ];
+        let chunks = extract_chunks(&[samples], &regions, 0.0).unwrap();
+        assert_eq!(chunks.len(), 1);
+        assert!((chunks[0].original_start - 0.5).abs() < 0.01);
+        assert!((chunks[0].original_end - 1.5).abs() < 0.01);
+        assert_eq!(chunks[0].samples.len(), 16000); // 1s of samples
+    }
+}
+
 /// Stub VAD when the `vad` feature is disabled.
 #[cfg(not(feature = "vad"))]
 fn detect_speech_for_speaker(
