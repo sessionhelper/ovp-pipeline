@@ -7,7 +7,7 @@
 //! scenes.
 
 use crate::error::{PipelineError, Result};
-use crate::types::TranscriptSegment;
+use crate::types::{PipelineBeat, TranscriptSegment};
 
 use super::{Operator, OperatorResult};
 
@@ -417,6 +417,29 @@ impl Operator for BeatOperator {
         }
 
         OperatorResult::Pass
+    }
+
+    fn collect_beats(&self) -> Vec<PipelineBeat> {
+        self.beats
+            .iter()
+            .enumerate()
+            .map(|(i, b)| {
+                // Estimate end_time from the next beat's timestamp, or fall
+                // back to start_time for the last beat.
+                let end_time = self
+                    .beats
+                    .get(i + 1)
+                    .map(|next| next.timestamp)
+                    .unwrap_or(b.timestamp);
+                PipelineBeat {
+                    beat_index: b.id,
+                    start_time: b.timestamp,
+                    end_time,
+                    title: b.title.clone(),
+                    summary: b.summary.clone(),
+                }
+            })
+            .collect()
     }
 
     async fn sweep(&mut self) -> Result<u32> {

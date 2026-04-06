@@ -211,12 +211,21 @@ pub async fn process_session(
         .map(|max| max + 1)
         .unwrap_or(0);
 
+    // Collect structural output from operators
+    let mut all_beats = Vec::new();
+    let mut all_scenes = Vec::new();
+    for op in operators.iter() {
+        all_beats.extend(op.collect_beats());
+        all_scenes.extend(op.collect_scenes());
+    }
+
     tracing::info!(
         stage = "operators",
         input_segments = pre_operator_count,
         kept = segments_produced,
         excluded = segments_excluded,
         scenes = scenes_detected,
+        beats = all_beats.len(),
         duration_ms = operator_ms,
         "operator chain complete"
     );
@@ -245,6 +254,8 @@ pub async fn process_session(
 
     Ok(PipelineResult {
         segments: processed,
+        beats: all_beats,
+        scenes: all_scenes,
         segments_produced,
         segments_excluded,
         scenes_detected,

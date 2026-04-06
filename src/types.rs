@@ -92,11 +92,49 @@ pub struct TranscriptSegment {
     pub exclude_reason: Option<String>,
 }
 
+/// A narrative beat detected by the BeatOperator.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PipelineBeat {
+    /// Beat index (0-based, sequential).
+    pub beat_index: u32,
+    /// Approximate start time in seconds.
+    pub start_time: f32,
+    /// End time in seconds. Set to start_time when no better estimate is available.
+    pub end_time: f32,
+    /// Short title for the beat.
+    pub title: String,
+    /// One-sentence summary.
+    pub summary: String,
+}
+
+/// A scene grouping produced by the SceneOperator.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PipelineScene {
+    /// Scene index (0-based, sequential).
+    pub scene_index: u32,
+    /// Start time in seconds (from the earliest beat in this scene).
+    pub start_time: f32,
+    /// End time in seconds (from the latest beat in this scene).
+    pub end_time: f32,
+    /// Scene title.
+    pub title: String,
+    /// One-sentence summary.
+    pub summary: String,
+    /// First beat index included in this scene (inclusive).
+    pub beat_start: u32,
+    /// Last beat index included in this scene (inclusive).
+    pub beat_end: u32,
+}
+
 /// Final output of the pipeline.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PipelineResult {
     /// All transcript segments (including excluded ones).
     pub segments: Vec<TranscriptSegment>,
+    /// Narrative beats detected by the beat operator.
+    pub beats: Vec<PipelineBeat>,
+    /// Scene groupings produced by the scene operator.
+    pub scenes: Vec<PipelineScene>,
     /// Number of segments that passed operators.
     pub segments_produced: u32,
     /// Number of segments excluded by operators.

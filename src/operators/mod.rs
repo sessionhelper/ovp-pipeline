@@ -10,7 +10,7 @@ pub mod scene;
 pub mod scene_chunker;
 
 use crate::error::{PipelineError, Result};
-use crate::types::TranscriptSegment;
+use crate::types::{PipelineBeat, PipelineScene, TranscriptSegment};
 
 /// Result of applying an operator to a single segment.
 #[derive(Debug, Clone)]
@@ -43,6 +43,16 @@ pub trait Operator: Send + Sync {
     /// Called once after all segments have been processed. Perform any
     /// final cleanup or retroactive marking.
     async fn finalize(&mut self) -> Result<()>;
+
+    /// Collect any narrative beats produced by this operator.
+    /// Called after all segments have been processed and sweep/finalize have run.
+    /// Default implementation returns empty — only the beat operator overrides.
+    fn collect_beats(&self) -> Vec<PipelineBeat> { Vec::new() }
+
+    /// Collect any scene groupings produced by this operator.
+    /// Called after all segments have been processed and sweep/finalize have run.
+    /// Default implementation returns empty — only the scene operator overrides.
+    fn collect_scenes(&self) -> Vec<PipelineScene> { Vec::new() }
 }
 
 /// Apply all operators to a list of transcript segments.
@@ -94,6 +104,28 @@ pub async fn apply_operators(
     );
 
     Ok(segments)
+}
+
+/// Create the default operator chain: hallucination detection + mechanical scene chunking.
+pub fn default_operators() -> Vec<Box<dyn Operator>> {
+    vec![
+        Box::new(hallucination::HallucinationOperator::new()),
+        Box::new(scene_chunker::SceneOperator::new(
+            scene_chunker::SceneOperatorConfig::default(),
+        )),
+    ]
+}
+
+/// Create the operator chain with LLM-backed beat detection + scene grouping.
+pub fn operators_with_llm_scene(
+    beat_config: beat::BeatConfig,
+    scene_config: scene::SceneConfig,
+) -> Vec<Box<dyn Operator>> {
+    vec![
+        Box::new(hallucination::HallucinationOperator::new()),
+        Box::new(beat::BeatOperator::new(beat_config)),
+        Box::new(scene::SceneOperator::new(scene_config)),
+    ]
 }
 
 #[cfg(test)]
@@ -196,26 +228,4 @@ mod tests {
         let excluded_count = thank_yous.iter().filter(|s| s.excluded).count();
         assert!(excluded_count > 0, "sweep should catch high-frequency short text");
     }
-}
-
-/// Create the default operator chain: hallucination detection + mechanical scene chunking.
-pub fn default_operators() -> Vec<Box<dyn Operator>> {
-    vec![
-        Box::new(hallucination::HallucinationOperator::new()),
-        Box::new(scene_chunker::SceneOperator::new(
-            scene_chunker::SceneOperatorConfig::default(),
-        )),
-    ]
-}
-
-/// Create the operator chain with LLM-backed beat detection + scene grouping.
-pub fn operators_with_llm_scene(
-    beat_config: beat::BeatConfig,
-    scene_config: scene::SceneConfig,
-) -> Vec<Box<dyn Operator>> {
-    vec![
-        Box::new(hallucination::HallucinationOperator::new()),
-        Box::new(beat::BeatOperator::new(beat_config)),
-        Box::new(scene::SceneOperator::new(scene_config)),
-    ]
 }

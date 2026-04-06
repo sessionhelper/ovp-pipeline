@@ -124,7 +124,7 @@ mod tests {
     #[test]
     fn same_rate_is_noop() {
         let speaker = make_speaker("a", vec![0.1, 0.2, 0.3], 16000);
-        let result = resample(&[speaker.clone()], 16000, 16000).unwrap();
+        let result = resample(std::slice::from_ref(&speaker), 16000, 16000).unwrap();
         assert_eq!(result[0].samples, speaker.samples);
         assert_eq!(result[0].sample_rate, 16000);
     }

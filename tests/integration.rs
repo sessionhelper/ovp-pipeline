@@ -281,7 +281,7 @@ async fn full_pipeline_scene_01() {
     let whisper_url = std::env::var("WHISPER_URL")
         .unwrap_or_else(|_| "http://localhost:8300/v1/audio/transcriptions".into());
     let client = reqwest::Client::new();
-    if client.get(&whisper_url.replace("/audio/transcriptions", "/models"))
+    if client.get(whisper_url.replace("/audio/transcriptions", "/models"))
         .send().await.is_err()
     {
         eprintln!("SKIP: Whisper endpoint not available at {}", whisper_url);

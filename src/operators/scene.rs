@@ -8,7 +8,7 @@
 //! BeatOperator handles fine-grained beat detection.
 
 use crate::error::{PipelineError, Result};
-use crate::types::TranscriptSegment;
+use crate::types::{PipelineScene, TranscriptSegment};
 
 use super::{Operator, OperatorResult};
 
@@ -351,6 +351,37 @@ impl Operator for SceneOperator {
         }
 
         OperatorResult::Pass
+    }
+
+    fn collect_scenes(&self) -> Vec<PipelineScene> {
+        self.scene_groups
+            .iter()
+            .enumerate()
+            .map(|(i, group)| {
+                // Derive scene time range from known beat timestamps.
+                let start_time = self
+                    .known_beats
+                    .iter()
+                    .find(|b| b.beat_id == group.beat_start)
+                    .map(|b| b.timestamp)
+                    .unwrap_or(0.0);
+                let end_time = self
+                    .known_beats
+                    .iter()
+                    .find(|b| b.beat_id == group.beat_end)
+                    .map(|b| b.timestamp)
+                    .unwrap_or(start_time);
+                PipelineScene {
+                    scene_index: i as u32,
+                    start_time,
+                    end_time,
+                    title: group.title.clone(),
+                    summary: group.summary.clone(),
+                    beat_start: group.beat_start,
+                    beat_end: group.beat_end,
+                }
+            })
+            .collect()
     }
 
     async fn sweep(&mut self) -> Result<u32> {
