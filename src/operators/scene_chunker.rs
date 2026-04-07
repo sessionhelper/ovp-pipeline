@@ -6,7 +6,7 @@
 //! - The current scene's duration exceeds `max_chunk_duration`
 
 use crate::error::Result;
-use crate::types::TranscriptSegment;
+use crate::types::{PipelineScene, TranscriptSegment};
 
 use super::{OperatorResult, Operator};
 
@@ -40,6 +40,16 @@ pub struct SceneOperator {
     last_end: Option<f32>,
     /// Total number of scenes created.
     scenes_created: u32,
+    /// Completed scene boundaries for `collect_scenes()`.
+    completed_scenes: Vec<SceneBoundary>,
+}
+
+/// Internal record of a scene's time boundaries.
+#[derive(Debug, Clone)]
+struct SceneBoundary {
+    index: u32,
+    start_time: f32,
+    end_time: f32,
 }
 
 impl SceneOperator {
@@ -51,6 +61,7 @@ impl SceneOperator {
             scene_start: None,
             last_end: None,
             scenes_created: 0,
+            completed_scenes: Vec::new(),
         }
     }
 
@@ -93,6 +104,15 @@ impl Operator for SceneOperator {
             self.scene_start = Some(segment.start_time);
             self.scenes_created = 1;
         } else if self.should_split(segment.start_time) {
+            // Close the current scene before starting a new one
+            if let (Some(start), Some(end)) = (self.scene_start, self.last_end) {
+                self.completed_scenes.push(SceneBoundary {
+                    index: self.current_group,
+                    start_time: start,
+                    end_time: end,
+                });
+            }
+
             // Start a new scene
             self.current_group += 1;
             self.scene_start = Some(segment.start_time);
@@ -116,7 +136,31 @@ impl Operator for SceneOperator {
         Ok(0)
     }
 
+    fn collect_scenes(&self) -> Vec<PipelineScene> {
+        self.completed_scenes
+            .iter()
+            .map(|sb| PipelineScene {
+                scene_index: sb.index,
+                start_time: sb.start_time,
+                end_time: sb.end_time,
+                title: format!("Scene {}", sb.index + 1),
+                summary: String::new(),
+                beat_start: 0,
+                beat_end: 0,
+            })
+            .collect()
+    }
+
     async fn finalize(&mut self) -> Result<()> {
+        // Close the last open scene so it appears in collect_scenes()
+        if let (Some(start), Some(end)) = (self.scene_start, self.last_end) {
+            self.completed_scenes.push(SceneBoundary {
+                index: self.current_group,
+                start_time: start,
+                end_time: end,
+            });
+        }
+
         tracing::info!(
             scenes = self.scenes_created,
             "scene operator finalized"
@@ -210,5 +254,53 @@ mod tests {
         assert_eq!(s1.chunk_group, Some(0));
         assert_eq!(s2.chunk_group, Some(0));
         assert_eq!(s3.chunk_group, Some(1));
+    }
+
+    #[tokio::test]
+    async fn collect_scenes_returns_all_scenes_after_finalize() {
+        let config = SceneOperatorConfig {
+            max_silence_gap: 10.0,
+            max_chunk_duration: 600.0,
+        };
+        let mut chunker = SceneOperator::new(config);
+
+        let mut s1 = make_segment(0.0, 5.0);
+        let mut s2 = make_segment(6.0, 10.0);
+        // 15s gap triggers scene split
+        let mut s3 = make_segment(25.0, 30.0);
+        let mut s4 = make_segment(31.0, 35.0);
+
+        chunker.on_segment(&mut s1).await;
+        chunker.on_segment(&mut s2).await;
+        chunker.on_segment(&mut s3).await;
+        chunker.on_segment(&mut s4).await;
+        chunker.finalize().await.unwrap();
+
+        let scenes = chunker.collect_scenes();
+        assert_eq!(scenes.len(), 2);
+        assert_eq!(scenes[0].scene_index, 0);
+        assert_eq!(scenes[0].start_time, 0.0);
+        assert_eq!(scenes[0].end_time, 10.0);
+        assert_eq!(scenes[1].scene_index, 1);
+        assert_eq!(scenes[1].start_time, 25.0);
+        assert_eq!(scenes[1].end_time, 35.0);
+    }
+
+    #[tokio::test]
+    async fn collect_scenes_single_scene_after_finalize() {
+        let mut chunker = SceneOperator::new(SceneOperatorConfig::default());
+
+        let mut s1 = make_segment(0.0, 5.0);
+        let mut s2 = make_segment(6.0, 10.0);
+
+        chunker.on_segment(&mut s1).await;
+        chunker.on_segment(&mut s2).await;
+        chunker.finalize().await.unwrap();
+
+        let scenes = chunker.collect_scenes();
+        assert_eq!(scenes.len(), 1);
+        assert_eq!(scenes[0].scene_index, 0);
+        assert_eq!(scenes[0].start_time, 0.0);
+        assert_eq!(scenes[0].end_time, 10.0);
     }
 }
