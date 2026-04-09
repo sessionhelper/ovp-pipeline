@@ -46,7 +46,7 @@ impl Default for PipelineConfig {
                 ),
                 beam_size: 5,
                 temperature: vec![0.0, 0.2, 0.4],
-                hallucination_logprob_threshold: -1.0,
+                hallucination_logprob_threshold: -0.85,
                 hallucination_no_speech_threshold: 0.5,
                 hallucination_compression_ratio: 1.8,
             },

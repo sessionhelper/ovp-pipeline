@@ -122,12 +122,12 @@ async fn transcribe_chunk(
         form = form.text("initial_prompt", prompt.clone());
     }
     if !config.temperature.is_empty() {
-        // faster-whisper-server accepts comma-separated temperatures
-        let temps: String = config.temperature.iter()
-            .map(|t| format!("{:.1}", t))
-            .collect::<Vec<_>>()
-            .join(",");
-        form = form.text("temperature", temps);
+        // The OpenAI-compatible endpoint accepts a single float. When
+        // multiple fallback temperatures are configured, send only the
+        // first one. Whisper internally falls back to higher temperatures
+        // if the compression ratio is poor; the API does not expose the
+        // fallback list directly.
+        form = form.text("temperature", format!("{:.1}", config.temperature[0]));
     }
 
     let send_start = std::time::Instant::now();
