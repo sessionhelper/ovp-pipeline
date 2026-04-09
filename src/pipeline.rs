@@ -50,7 +50,7 @@ impl Default for PipelineConfig {
                 hallucination_no_speech_threshold: 0.5,
                 hallucination_compression_ratio: 1.8,
             },
-            min_chunk_duration: 1.5,
+            min_chunk_duration: 1.0,
         }
     }
 }
