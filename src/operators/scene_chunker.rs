@@ -282,9 +282,11 @@ mod tests {
         assert_eq!(scenes[0].scene_index, 0);
         assert_eq!(scenes[0].start_time, 0.0);
         assert_eq!(scenes[0].end_time, 10.0);
+        assert_eq!(scenes[0].title, "Scene 1");
         assert_eq!(scenes[1].scene_index, 1);
         assert_eq!(scenes[1].start_time, 25.0);
         assert_eq!(scenes[1].end_time, 35.0);
+        assert_eq!(scenes[1].title, "Scene 2");
     }
 
     #[tokio::test]
@@ -303,5 +305,12 @@ mod tests {
         assert_eq!(scenes[0].scene_index, 0);
         assert_eq!(scenes[0].start_time, 0.0);
         assert_eq!(scenes[0].end_time, 10.0);
+    }
+
+    #[tokio::test]
+    async fn collect_scenes_empty_when_no_segments() {
+        let mut chunker = SceneOperator::new(SceneOperatorConfig::default());
+        chunker.finalize().await.unwrap();
+        assert_eq!(chunker.collect_scenes().len(), 0);
     }
 }
