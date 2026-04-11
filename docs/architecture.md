@@ -1,4 +1,4 @@
-# OVP Pipeline — Architecture
+# chronicle-pipeline — Architecture
 
 ## Purpose
 
