@@ -12,12 +12,29 @@ The full processing pipeline from "I have mono f32 samples for each speaker" to 
 
 - Resample to 16kHz (if input is at a different rate)
 - RMS audio detection (silence gate)
-- Silero VAD (speech vs non-speech)
-- Whisper transcription (via external HTTP endpoint)
-- Hallucination filtering
-- Scene chunking
+- Silero VAD v6 — two APIs:
+  - Stateless `detect_speech_for_speaker` for the batch path
+  - **`VadSession`** — stateful wrapper carrying LSTM hidden/cell state across
+    chunks so the streaming pipeline sees a continuous signal
+- Whisper transcription (via external HTTP endpoint) with beam search,
+  temperature fallback, and initial prompts
+- Hallucination filtering — both in the Whisper stage (logprob / no_speech /
+  compression_ratio thresholds) and via the `HallucinationOperator`
+  (frequency-based cross-speaker dedup)
+- Metatalk classification (in-character vs out-of-character, rule-based)
+- Scene chunking (mechanical, silence + duration driven)
+- Optional LLM-backed beat + scene detection operators
 - *(Planned)* Lore reconciliation (name correction + entity linking via lore API)
-- *(Planned)* Context-aware scene segmentation (LLM)
+
+Two execution modes:
+
+- **`process_session`** (`pipeline.rs`) — batch: decode everything, run every
+  stage end-to-end, run operators, return a `PipelineResult`.
+- **`StreamingPipeline`** (`streaming.rs`) — incremental: `feed_chunk()` runs
+  resample → RMS → stateful VAD → Whisper on each arriving chunk and returns
+  any new segments produced; `finalize()` flushes trailing VAD regions and
+  runs the operator chain over the accumulated segments. The worker uses this
+  path for real-time transcription during an active recording.
 
 Each stage is self-contained: it has its own config with whatever HTTP endpoints it needs, manages its own calls, and transforms its input stream into its output stream. No shared HTTP client or central services config.
 
@@ -286,22 +303,100 @@ pub struct TranscriberConfig {
     pub endpoint: String,
     pub model: String,
     pub language: Option<String>,
+    /// Anchors the language model toward the expected domain vocabulary.
+    /// The worker sets "TTRPG session dialogue. Multiple speakers discussing
+    /// combat, exploration, and roleplay." by default.
+    pub initial_prompt: Option<String>,
+    /// Beam size for decoding. Default 5.
+    pub beam_size: u32,
+    /// Temperature fallback list. Whisper falls back to higher temperatures
+    /// when compression_ratio exceeds its threshold. Default [0.0, 0.2, 0.4].
+    pub temperature: Vec<f32>,
+    /// avg_logprob threshold — segments below this are dropped as hallucinations.
+    /// Default -0.4.
+    pub hallucination_logprob_threshold: f32,
+    /// no_speech_prob threshold — segments above this are dropped as silence.
+    /// Default 0.5.
+    pub hallucination_no_speech_threshold: f32,
+    /// compression_ratio threshold — segments above this are dropped as
+    /// repetitive hallucinations ("Thank you thank you thank you..."). Default 1.8.
+    pub hallucination_compression_ratio: f32,
 }
 ```
 
-### 5. Operator Chain
+Whisper-stage hallucination thresholds are the first line of defence.
+The `HallucinationOperator` (below) is the second line for frequency-based
+cross-speaker dedup.
 
-Pluggable via the `Operator` trait. Crate ships four operators:
+### 5. Streaming Pipeline
 
-**Hallucination Filter:** Frequency-based, no hardcoded phrase list. With RMS+VAD in place, this is a secondary defense. Also handles cross-speaker deduplication.
+**Files:** `streaming.rs` + `vad/mod.rs::VadSession`
 
-**Scene Chunker:** Assigns `chunk_group` to segments based on silence gaps and duration limits.
+The streaming pipeline is a parallel entry point to the same stages used by
+`process_session`, but threaded so the worker can feed chunks as they arrive:
 
-**Scene Operator:** Optional LLM-backed scene boundary detection.
+```rust
+let mut pipeline = StreamingPipeline::new(StreamingConfig {
+    rms, vad, whisper,
+    input_sample_rate: 48_000,
+    session_id,
+});
 
-**Beat Operator:** Groups segments into narrative beats with titles and summaries.
+// Per chunk: resample → RMS → stateful VAD → Whisper, returning any new segments.
+let new_segments = pipeline.feed_chunk(pseudo_id, mono_f32_samples).await?;
+
+// On session end: flush trailing VAD, run the operator chain.
+let result = pipeline.finalize(&mut operators).await?;
+```
+
+Per-speaker state is carried in a `SpeakerState` that owns:
+
+- The persistent `VadSession` (Silero LSTM state across chunks)
+- Accumulated resampled 16 kHz samples (so Whisper can be given any speech
+  region back by absolute time)
+- Cumulative `time_offset` for absolute timestamping
+
+Chunk-arrival latency is bounded by `min_chunk_duration` (default 1.0 s) — the
+pipeline only sends a speech region to Whisper once the VAD has closed the
+region. Segments are posted back to the data-api immediately after Whisper
+returns, so the frontend sees transcripts mid-session.
+
+Operators are deliberately deferred to `finalize()` because they need
+cross-segment context — scene chunking, beat detection and metatalk
+classification all look at the full conversation arc.
+
+### 6. Operator Chain
+
+Pluggable via the `Operator` trait. The `default_operators()` chain is:
+
+1. **`HallucinationOperator`** — Frequency-based, no hardcoded phrase list.
+   With RMS + VAD + Whisper-stage thresholds in place, this catches the
+   "Thank you." / "Yeah." / stock phrase spam that leaks through.
+
+2. **`MetatalkOperator`** — Rule-based classifier that tags each segment as
+   `"ic"` (in-character) or `"ooc"` (table talk) via strong OOC patterns
+   ("roll a d20", "saving throw", "hit points") and weak OOC keyword counts.
+   Ambiguous segments default to `"ic"` because keeping roleplay is safer
+   than dropping it. No LLM required.
+
+3. **`SceneOperator`** (`scene_chunker.rs`) — Mechanical scene boundary
+   detection. Assigns sequential `chunk_group` IDs based on silence gaps
+   (default 30 s) and max scene duration (default 600 s).
+
+The `operators_with_llm_scene()` variant replaces the mechanical scene chunker
+with the LLM-backed `BeatOperator` + `SceneOperator` (from `operators/beat.rs`
+and `operators/scene.rs`) which group segments into narrative beats and scenes
+with titles and summaries via an external OpenAI-compatible endpoint.
+
+Scene/beat structural output is collected from operators via
+`Operator::collect_beats()` and `collect_scenes()` after the chain runs.
+Only operators that produce structural output override these methods (the
+LLM-backed `BeatOperator` and `SceneOperator`); the mechanical scene chunker
+only sets `chunk_group` on segments and does not emit `PipelineScene` rows.
 
 ## Public API
+
+Batch entry point:
 
 ```rust
 pub async fn process_session(
@@ -309,6 +404,31 @@ pub async fn process_session(
     input: SessionInput,
     operators: &mut [Box<dyn Operator>],
 ) -> Result<PipelineResult>
+```
+
+Streaming entry point:
+
+```rust
+pub struct StreamingPipeline { /* ... */ }
+
+impl StreamingPipeline {
+    pub fn new(config: StreamingConfig) -> Self;
+
+    /// Process one chunk of mono f32 samples for a speaker and return
+    /// any new segments produced. The LSTM VAD state carries across calls.
+    pub async fn feed_chunk(
+        &mut self,
+        speaker: &str,
+        samples: Vec<f32>,
+    ) -> Result<Vec<TranscriptSegment>>;
+
+    /// Flush trailing VAD state and run the operator chain over all
+    /// accumulated segments. Consumes the pipeline.
+    pub async fn finalize(
+        mut self,
+        operators: &mut [Box<dyn Operator>],
+    ) -> Result<PipelineResult>;
+}
 ```
 
 ```rust
@@ -348,7 +468,8 @@ chronicle-pipeline/
 │   ├── lib.rs                      # Public API + re-exports
 │   ├── types.rs                    # SpeakerTrack, AudioChunk, TranscriptSegment, etc.
 │   ├── error.rs                    # PipelineError enum
-│   ├── pipeline.rs                 # Orchestration: decode → resample → RMS → VAD → Whisper → filters
+│   ├── pipeline.rs                 # Batch orchestration (process_session)
+│   ├── streaming.rs                # Incremental orchestration (StreamingPipeline)
 │   ├── ad/
 │   │   └── mod.rs                  # RMS audio detection (tier 1)
 │   ├── audio/
@@ -357,17 +478,24 @@ chronicle-pipeline/
 │   │   ├── encode.rs               # Stub: f32 → Opus/OGG (future)
 │   │   └── mix.rs                  # Stub: multi-track mixing (future)
 │   ├── vad/
-│   │   └── mod.rs                  # Silero VAD v6 via ort (tier 2)
+│   │   └── mod.rs                  # Silero VAD v6 via ort, stateless
+│   │                               # detect_speech_for_speaker + stateful
+│   │                               # VadSession (feed/flush)
 │   ├── transcribe/
-│   │   └── mod.rs                  # Whisper HTTP endpoint client
-│   └── operators/
-│       ├── mod.rs                  # Operator trait + default_operators
-│       ├── hallucination.rs        # Frequency-based detection
-│       ├── scene_chunker.rs        # Silence-gap-based grouping
-│       ├── scene.rs                # LLM-backed scene boundaries (optional)
-│       └── beat.rs                 # Narrative beat grouping
-└── src/bin/
-    └── cli.rs                      # TEST SCAFFOLD (not library API)
+│   │   └── mod.rs                  # Whisper HTTP endpoint client with
+│   │                               # beam search + temperature fallback +
+│   │                               # hallucination thresholds
+│   ├── operators/
+│   │   ├── mod.rs                  # Operator trait, default_operators,
+│   │   │                           # operators_with_llm_scene
+│   │   ├── hallucination.rs        # Frequency-based detection
+│   │   ├── metatalk.rs             # IC / OOC rule-based classifier
+│   │   ├── scene_chunker.rs        # Silence-gap-based grouping
+│   │   ├── scene.rs                # LLM-backed scene boundaries (optional)
+│   │   └── beat.rs                 # LLM-backed narrative beats (optional)
+│   └── bin/
+│       └── cli.rs                  # TEST SCAFFOLD (not library API)
+└── tests/                          # Integration + fixture tests
 ```
 
 ## Dependencies

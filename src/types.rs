@@ -86,6 +86,10 @@ pub struct TranscriptSegment {
     pub beat_id: Option<u32>,
     /// Scene/chunk group assigned by the scene operator.
     pub chunk_group: Option<u32>,
+    /// Whether this is in-character roleplay or out-of-character table talk.
+    /// Set by the metatalk operator. Values: "ic" or "ooc".
+    #[serde(default)]
+    pub talk_type: Option<String>,
     /// Whether this segment was excluded by an operator.
     pub excluded: bool,
     /// Reason for exclusion, if excluded.

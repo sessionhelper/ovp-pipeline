@@ -17,6 +17,22 @@ pub struct TranscriberConfig {
     pub model: String,
     /// Language hint for Whisper. `None` for auto-detect.
     pub language: Option<String>,
+    /// Initial prompt to condition Whisper's language model.
+    /// Anchors toward expected domain vocabulary.
+    pub initial_prompt: Option<String>,
+    /// Beam size for search. Higher = more accurate but slower.
+    /// Default 5. Set to 1 for greedy decoding.
+    pub beam_size: u32,
+    /// Temperature for fallback sampling. Whisper tries each in order,
+    /// falling back if compression_ratio exceeds the threshold.
+    pub temperature: Vec<f32>,
+    /// Segments with avg_logprob below this are likely hallucinations.
+    pub hallucination_logprob_threshold: f32,
+    /// Segments with no_speech_prob above this are likely silence.
+    pub hallucination_no_speech_threshold: f32,
+    /// Segments with compression_ratio above this are likely repetitive
+    /// hallucinations ("Thank you thank you thank you...").
+    pub hallucination_compression_ratio: f32,
 }
 
 /// Transcribe all audio chunks via the external Whisper endpoint.
@@ -90,6 +106,7 @@ async fn transcribe_chunk(
     let mut form = reqwest::multipart::Form::new()
         .text("model", config.model.clone())
         .text("response_format", "verbose_json")
+        .text("beam_size", config.beam_size.to_string())
         .part(
             "file",
             reqwest::multipart::Part::bytes(wav_bytes.clone())
@@ -100,6 +117,17 @@ async fn transcribe_chunk(
 
     if let Some(ref lang) = config.language {
         form = form.text("language", lang.clone());
+    }
+    if let Some(ref prompt) = config.initial_prompt {
+        form = form.text("initial_prompt", prompt.clone());
+    }
+    if !config.temperature.is_empty() {
+        // The OpenAI-compatible endpoint accepts a single float. When
+        // multiple fallback temperatures are configured, send only the
+        // first one. Whisper internally falls back to higher temperatures
+        // if the compression ratio is poor; the API does not expose the
+        // fallback list directly.
+        form = form.text("temperature", format!("{:.1}", config.temperature[0]));
     }
 
     let send_start = std::time::Instant::now();
@@ -139,8 +167,44 @@ async fn transcribe_chunk(
         .iter()
         .filter_map(|seg| {
             let text = seg["text"].as_str()?.trim().to_string();
+            if text.is_empty() {
+                return None;
+            }
             let start = seg["start"].as_f64()? as f32;
             let end = seg["end"].as_f64()? as f32;
+
+            let avg_logprob = seg["avg_logprob"].as_f64().unwrap_or(-1.0) as f32;
+            let no_speech_prob = seg["no_speech_prob"].as_f64().unwrap_or(0.0) as f32;
+            let compression_ratio = seg["compression_ratio"].as_f64().unwrap_or(1.0) as f32;
+
+            // Filter likely hallucinations
+            if avg_logprob < config.hallucination_logprob_threshold {
+                tracing::debug!(
+                    speaker = %chunk.speaker,
+                    text = %text,
+                    avg_logprob,
+                    "hallucination_filtered: low logprob"
+                );
+                return None;
+            }
+            if no_speech_prob > config.hallucination_no_speech_threshold {
+                tracing::debug!(
+                    speaker = %chunk.speaker,
+                    text = %text,
+                    no_speech_prob,
+                    "hallucination_filtered: high no_speech_prob"
+                );
+                return None;
+            }
+            if compression_ratio > config.hallucination_compression_ratio {
+                tracing::debug!(
+                    speaker = %chunk.speaker,
+                    text = %text,
+                    compression_ratio,
+                    "hallucination_filtered: high compression_ratio"
+                );
+                return None;
+            }
 
             // Map Whisper-relative timestamps to absolute session time
             let absolute_start = chunk.original_start + start;
@@ -158,9 +222,10 @@ async fn transcribe_chunk(
                 end_time: absolute_end,
                 text: text.clone(),
                 original_text: text,
-                confidence: seg["avg_logprob"].as_f64().map(|v| v as f32),
+                confidence: Some(avg_logprob),
                 beat_id: None,
                 chunk_group: None,
+                talk_type: None,
                 excluded: false,
                 exclude_reason: None,
             })

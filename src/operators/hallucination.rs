@@ -234,6 +234,7 @@ mod tests {
             confidence: None,
             beat_id: None,
             chunk_group: None,
+            talk_type: None,
             excluded: false,
             exclude_reason: None,
         }

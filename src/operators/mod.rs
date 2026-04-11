@@ -6,6 +6,7 @@
 
 pub mod beat;
 pub mod hallucination;
+pub mod metatalk;
 pub mod scene;
 pub mod scene_chunker;
 
@@ -106,10 +107,11 @@ pub async fn apply_operators(
     Ok(segments)
 }
 
-/// Create the default operator chain: hallucination detection + mechanical scene chunking.
+/// Create the default operator chain: hallucination detection + metatalk classification + mechanical scene chunking.
 pub fn default_operators() -> Vec<Box<dyn Operator>> {
     vec![
         Box::new(hallucination::HallucinationOperator::new()),
+        Box::new(metatalk::MetatalkOperator::new()),
         Box::new(scene_chunker::SceneOperator::new(
             scene_chunker::SceneOperatorConfig::default(),
         )),
@@ -123,6 +125,7 @@ pub fn operators_with_llm_scene(
 ) -> Vec<Box<dyn Operator>> {
     vec![
         Box::new(hallucination::HallucinationOperator::new()),
+        Box::new(metatalk::MetatalkOperator::new()),
         Box::new(beat::BeatOperator::new(beat_config)),
         Box::new(scene::SceneOperator::new(scene_config)),
     ]
@@ -146,6 +149,7 @@ mod tests {
             confidence: None,
             chunk_group: None,
             beat_id: None,
+            talk_type: None,
             excluded: false,
             exclude_reason: None,
         }

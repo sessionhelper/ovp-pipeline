@@ -39,8 +39,18 @@ impl Default for PipelineConfig {
                 endpoint: "http://localhost:8080/v1/audio/transcriptions".into(),
                 model: "large-v3-turbo".into(),
                 language: Some("en".into()),
+                initial_prompt: Some(
+                    "TTRPG session dialogue. Multiple speakers discussing \
+                     combat, exploration, and roleplay."
+                        .into(),
+                ),
+                beam_size: 5,
+                temperature: vec![0.0, 0.2, 0.4],
+                hallucination_logprob_threshold: -0.4,
+                hallucination_no_speech_threshold: 0.5,
+                hallucination_compression_ratio: 1.8,
             },
-            min_chunk_duration: 0.8,
+            min_chunk_duration: 1.0,
         }
     }
 }
